@@ -84,6 +84,8 @@ class _MicNode(Node):
         self._sock:   socket.socket | None = None
         self._thread: threading.Thread | None = None
         self.state   = "idle"
+        self._packet_count = 0
+        self._last_packet_ts = 0.0
         self.get_logger().info(f"MicNode ready — topic: {topic}")
 
     def start_capture(self) -> str:
@@ -102,7 +104,7 @@ class _MicNode(Node):
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.settimeout(0.5)
         self._sock   = sock
-        self.state   = "running"
+        self._packet_count = 0
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
         self.get_logger().info(f"Capture started — multicast {MIC_GROUP_IP}:{MIC_PORT}")
@@ -128,6 +130,8 @@ class _MicNode(Node):
                 continue
             except OSError:
                 break
+            self._packet_count += 1
+            self._last_packet_ts = time.monotonic()
             while len(buf) >= CHUNK_BYTES:
                 chunk = bytes(buf[:CHUNK_BYTES])
                 del buf[:CHUNK_BYTES]
@@ -156,19 +160,79 @@ class MicPlugin:
         }
 
     def start(self) -> None:
-        self._node.start_capture()
+        self._node.start_capture()  # start capture early but no self-check here
 
     def stop(self) -> None:
         self._node.stop_capture()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            return {"state": "running"}
+            self._node.start_capture()
+            # Self-check: verify full pipeline (multicast → ROS2 publish → subscribable)
+            state, message = self._self_check()
+            return {"state": state, "message": message} if message else {"state": state}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": self._node.state, "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+            last_ago = int((time.monotonic() - self._node._last_packet_ts) * 1000) if self._node._last_packet_ts > 0 else -1
+            return {
+                "state": self._node.state,
+                "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+                "packets": self._node._packet_count,
+                "last_packet_ago_ms": last_ago,
+            }
         return None
+
+    def _self_check(self) -> tuple[str, str]:
+        """Verify mic pipeline: multicast receiving + ROS2 topic subscribable.
+
+        Check 1: multicast packets arriving (in-process).
+        Check 2: ROS2 topic receivable from a subprocess (avoids same-process
+                 FastDDS intra-participant matching issues).
+        """
+        import time as _t
+
+        # Check 1: multicast receiving
+        if self._node._packet_count == 0:
+            deadline = _t.monotonic() + 3.0
+            while _t.monotonic() < deadline and self._node._packet_count == 0:
+                _t.sleep(0.1)
+        if self._node._packet_count == 0:
+            self._node.state = "error"
+            return "error", "no multicast packets received in 3s"
+
+        # Check 2: ROS2 topic receivable — use subprocess to avoid same-process DDS issues
+        check_script = (
+            "import sys, rclpy, time;"
+            "from rclpy.node import Node;"
+            "from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy;"
+            "from audio_msgs.msg import AudioChunk;"
+            "rclpy.init();"
+            "n = Node('_mic_check');"
+            "qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,"
+            "history=HistoryPolicy.KEEP_LAST, depth=10, durability=DurabilityPolicy.VOLATILE);"
+            "ok = [False];"
+            "n.create_subscription(AudioChunk, sys.argv[1], lambda m: ok.__setitem__(0, True), qos);"
+            "dl = time.monotonic() + 3.0;"
+            "\nwhile time.monotonic() < dl and not ok[0]: rclpy.spin_once(n, timeout_sec=0.1)\n"
+            "rclpy.shutdown();"
+            "sys.exit(0 if ok[0] else 1)"
+        )
+        try:
+            result = subprocess.run(
+                ["python3", "-c", check_script, self._topic],
+                timeout=5,
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                self._node.state = "error"
+                return "error", "topic published but not receivable via ROS2"
+        except (subprocess.TimeoutExpired, Exception) as e:
+            self._node.state = "error"
+            return "error", f"ROS2 subscribe check failed: {e}"
+
+        self._node.state = "running"
+        return "running", ""
 
 
 # ── NativeTtsPlugin (actuator) ────────────────────────────────────────────────
@@ -198,10 +262,14 @@ class NativeTtsPlugin:
                     "volume": {"type": "integer", "description": "Volume 0-100"},
                 },
                 "required": ["action"],
+                "x-resource": "mouth",
                 "x-action-params": {
                     "speak":      {"params": ["text", "voice"],  "description": "Synthesize text to speech on the robot"},
                     "get_volume": {"params": [],                 "description": "Get current speaker volume"},
                     "set_volume": {"params": ["volume"],         "description": "Set speaker volume (0-100)"},
+                },
+                "x-hooks": {
+                    "on_notify": {"action": "speak"},
                 },
             },
         }
@@ -238,8 +306,36 @@ APP_NAME = "r1_speaker"
 
 
 class _SpeakerNode(Node):
-    PREFILL = 5       # buffer 5 chunks (~160ms) before starting playback
+    # Prefill is counted in bytes, not chunks: the upstream chunk size is the
+    # TTS's choice (perception sends 3200B/100ms, README.md allows down to
+    # 1024B), so "3 chunks ≈ 300ms" silently became 96ms on a conforming
+    # producer — starting the drain already starved of the 300ms block it is
+    # about to try to assemble.
+    PREFILL_BYTES = 9600  # ~300ms @ 16k/16bit/mono before playback starts
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
+    EMPTY_POLL_S = 0.1  # _buf.get timeout — one unit of "idle"
+    # Idle tolerance. Only EXIT_AFTER_IDLE moved: it used to be 3 (300ms), so a
+    # stall of one text chunk's synthesis on the TTS side tore the drain thread
+    # down, and restarting it cost another PREFILL_BYTES on top of the stall.
+    # That is why a gap upstream was always audibly *longer* on the robot than
+    # the stall that caused it. FLUSH_AFTER_IDLE stays short on purpose: when
+    # the stream goes quiet mid-utterance the MCU holds at most MAX_LEAD_S, so
+    # pushing the partial block out early is what shortens the silence.
+    FLUSH_AFTER_IDLE = 2  # 200ms with no data → push out the partial block
+    EXIT_AFTER_IDLE = 15  # 1.5s with nothing at all → drain thread may exit
+    # How far ahead of the audio timeline PlayStream may run. The old code did
+    # `duration - elapsed - 0.08` per block with no cumulative deadline, so it
+    # ran 220ms of wall clock per 300ms of audio — a permanent, compounding
+    # +80ms/block overrun of the MCU's queue. On R1 every call additionally
+    # crosses rpc_proxy's IPC queue, so the per-block cost is less predictable
+    # still and a bounded deadline matters more.
+    MAX_LEAD_S = 0.24
+
+    # Sentinel meaning "utterance finished, flush what you have now".
+    _END_OF_UTTERANCE = object()
+
+    # EOF magic: 8 bytes (4 samples [1,-1,1,-1])，标记 utterance 结束
+    AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
 
     def __init__(self, audio_client: AudioClient):
         super().__init__("r1_speaker")
@@ -249,10 +345,19 @@ class _SpeakerNode(Node):
         self._idx    = 0
         self.state   = "idle"
         self._buf = queue.Queue()
+        self._pending_bytes = 0  # bytes buffered while no drain thread is running
         self._draining = threading.Event()
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
         self._flush_timer = None
+        # 打断/暂停控制
+        self._lock = threading.Lock()
+        self._interrupt_flag = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # 初始为非暂停状态
+        self._muted = False  # interrupt 后静默，丢弃后续 chunks 直到 EOF
+        # Clear stale PlayStream session from previous container run (MCU keeps state across reboot)
+        self._client.PlayStop(APP_NAME)
         self.get_logger().info("SpeakerNode ready")
 
     def start_play(self, topic: str) -> str:
@@ -261,10 +366,11 @@ class _SpeakerNode(Node):
                 return self._topic
             self.stop_play()
         self._topic = topic
+        self._muted = False  # 新 start 时清除静默
         self._sub = self.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
         )
-        self.state = "playing"
+        self.state = "ready"
         self.get_logger().info(f"[speaker] subscribed to {topic}")
         return topic
 
@@ -277,28 +383,115 @@ class _SpeakerNode(Node):
             self.destroy_subscription(self._sub)
             self._sub = None
         self._draining.clear()
+        self._pause_event.set()
+        self._interrupt_flag.set()
         if self._drain_thread is not None:
             self._drain_thread.join(timeout=2)
             self._drain_thread = None
+        self._interrupt_flag.clear()
         while not self._buf.empty():
             try:
                 self._buf.get_nowait()
             except queue.Empty:
                 break
+        self._pending_bytes = 0
         try:
             self._client.PlayStop(APP_NAME)
         except Exception as e:
             self.get_logger().warn(f"PlayStop error: {e}")
         self.state = "idle"
 
+    def interrupt(self) -> dict:
+        """立即中止播放：清空 buffer，停止 SDK，保持 subscription。"""
+        with self._lock:
+            self._interrupt_flag.set()
+            while not self._buf.empty():
+                try:
+                    self._buf.get_nowait()
+                except queue.Empty:
+                    break
+            self._pending_bytes = 0
+            try:
+                self._client.PlayStop(APP_NAME)
+            except Exception as e:
+                self.get_logger().warn(f"[speaker] interrupt PlayStop error: {e}")
+            if self._drain_thread is not None and self._drain_thread.is_alive():
+                self._drain_thread.join(timeout=1)
+                self._drain_thread = None
+            self._interrupt_flag.clear()
+            self._pause_event.set()
+            self._draining.clear()
+            self._muted = True  # 静默：丢弃后续 TTS chunks 直到 EOF
+            self.state = "ready"
+        self.get_logger().info("[speaker] interrupted — buffer cleared, muted until EOF")
+        return {"state": "ready", "action": "interrupted"}
+
+    def pause(self) -> dict:
+        """暂停播放：停止 SDK，保留 buffer。"""
+        with self._lock:
+            if self.state not in ("playing", "ready"):
+                return {"state": self.state, "error": "not playing"}
+            self._pause_event.clear()
+            try:
+                self._client.PlayStop(APP_NAME)
+            except Exception as e:
+                self.get_logger().warn(f"[speaker] pause PlayStop error: {e}")
+            self.state = "paused"
+        self.get_logger().info(f"[speaker] paused — buffer size={self._buf.qsize()}")
+        return {"state": "paused", "buffer_chunks": self._buf.qsize()}
+
+    def resume(self) -> dict:
+        """恢复播放：从 buffer 中剩余内容继续。"""
+        with self._lock:
+            if self.state != "paused":
+                return {"state": self.state, "error": "not paused"}
+            self.state = "playing"
+            self._pause_event.set()
+            if self._drain_thread is None or not self._drain_thread.is_alive():
+                if not self._buf.empty():
+                    self._start_drain()
+        self.get_logger().info("[speaker] resumed")
+        return {"state": "playing"}
+
     def _on_chunk(self, msg: AudioChunk) -> None:
         pcm = bytes(msg.data)
+        now = time.monotonic()
         self._idx += 1
+
+        # 检测 EOF magic：utterance 结束标记
+        if len(pcm) == 8 and pcm == self.AUDIO_EOF_MAGIC:
+            if self._muted:
+                self._muted = False
+                self.get_logger().info("[speaker] unmuted — received EOF marker")
+                return
+            # EOF 是明确的「本句结束」信号。用它立刻冲出残块，就不必靠空等超时
+            # 来发现句尾 —— 否则放宽 FLUSH_AFTER_IDLE 会给每句尾都加上几百 ms。
+            self._last_chunk_time = now
+            if self._draining.is_set():
+                self._buf.put(self._END_OF_UTTERANCE)
+            elif not self._buf.empty() and self.state == "playing":
+                self._start_drain()
+            return
+
+        # Muted 状态：interrupt 后丢弃来自旧 utterance 的 chunks
+        if self._muted:
+            self._last_chunk_time = now
+            return
+
         self._buf.put(pcm)
-        self._last_chunk_time = time.monotonic()
-        if not self._draining.is_set() and self._buf.qsize() >= self.PREFILL:
+        # 只统计「等待 drain 启动」期间攒下的字节。drain 运行时这些 chunk 是被
+        # 消耗掉的，计入就会让计数器一路涨到整句大小 —— 等 drain 因
+        # EXIT_AFTER_IDLE 自行退出后，下一句的第一个 chunk 就满足了 prefill。
+        # 旧代码读 _buf.qsize() 时天然没有这个问题，因为那是个派生量。
+        if not self._draining.is_set():
+            self._pending_bytes += len(pcm)
+        self._last_chunk_time = now
+        if self.state == "ready":
+            self.state = "playing"
+        if (not self._draining.is_set() and self.state == "playing"
+                and self._pending_bytes >= self.PREFILL_BYTES):
             self._start_drain()
-        elif not self._draining.is_set() and self._flush_timer is None:
+        elif not self._draining.is_set() and self.state == "playing" and self._flush_timer is None:
             self._flush_timer = self.create_timer(0.2, self._check_flush)
 
     def _start_drain(self) -> None:
@@ -306,6 +499,7 @@ class _SpeakerNode(Node):
             self._flush_timer.cancel()
             self.destroy_timer(self._flush_timer)
             self._flush_timer = None
+        self._pending_bytes = 0
         self._draining.set()
         self._drain_thread = threading.Thread(target=self._drain, daemon=True)
         self._drain_thread.start()
@@ -315,7 +509,7 @@ class _SpeakerNode(Node):
             self._flush_timer.cancel()
             self.destroy_timer(self._flush_timer)
             self._flush_timer = None
-        if not self._draining.is_set() and not self._buf.empty():
+        if not self._draining.is_set() and not self._buf.empty() and self.state == "playing":
             idle = time.monotonic() - self._last_chunk_time
             if idle >= 0.15:
                 self._start_drain()
@@ -323,31 +517,59 @@ class _SpeakerNode(Node):
     def _drain(self) -> None:
         play_idx = 0
         merged = b''
-        empty_count = 0
+        idle = 0
+        max_idle = 0
+        deadline = None
         while self._draining.is_set():
+            if self._interrupt_flag.is_set():
+                return
+            if not self._pause_event.wait(timeout=0.1):
+                continue
+
             try:
-                pcm = self._buf.get(timeout=0.1)
-                merged += pcm
-                empty_count = 0
+                item = self._buf.get(timeout=self.EMPTY_POLL_S)
+                idle = 0
             except queue.Empty:
-                empty_count += 1
-                if merged and empty_count >= 2:
+                idle += 1
+                max_idle = max(max_idle, idle)
+                if merged and idle >= self.FLUSH_AFTER_IDLE:
                     play_idx += 1
-                    self._play_merged(merged, play_idx)
+                    deadline = self._play_merged(merged, play_idx, deadline)
                     merged = b''
-                elif not merged and empty_count >= 3:
+                elif not merged and idle >= self.EXIT_AFTER_IDLE:
                     break
                 continue
+            if item is self._END_OF_UTTERANCE:
+                # 句尾：立刻把残块播完，但不退出线程 —— 下一句马上就来，
+                # 重建线程要重新攒满 PREFILL_BYTES，那就是可听的空洞。
+                if merged:
+                    play_idx += 1
+                    deadline = self._play_merged(merged, play_idx, deadline)
+                    merged = b''
+                continue
+            merged += item
             if len(merged) >= self.MERGE_BYTES:
                 play_idx += 1
-                self._play_merged(merged, play_idx)
+                deadline = self._play_merged(merged, play_idx, deadline)
                 merged = b''
-        if merged:
+        if merged and not self._interrupt_flag.is_set():
             play_idx += 1
-            self._play_merged(merged, play_idx)
+            self._play_merged(merged, play_idx, deadline)
         self._draining.clear()
+        # 清掉 drain 运行期间可能漏进来的计数（_on_chunk 的检查与这里存在竞态），
+        # 保证下一句必须重新攒满 PREFILL_BYTES 才启动。
+        self._pending_bytes = 0
+        if self.state == "playing":
+            self.state = "ready"
+        self.get_logger().info(
+            f"[speaker] drain finished: blocks={play_idx} "
+            f"max_idle={max_idle * self.EMPTY_POLL_S:.1f}s"
+        )
 
-    def _play_merged(self, pcm: bytes, idx: int) -> None:
+    def _play_merged(self, pcm: bytes, idx: int, deadline: float | None) -> float | None:
+        """Send one block; return the wall-clock deadline for the next one."""
+        if self._interrupt_flag.is_set():
+            return deadline
         duration = len(pcm) / 32000
         t0 = time.monotonic()
         try:
@@ -356,10 +578,22 @@ class _SpeakerNode(Node):
                 self.get_logger().error(f"[speaker] PlayStream error code={code}")
         except Exception as e:
             self.get_logger().error(f"[speaker] PlayStream error: {e}")
-        elapsed = time.monotonic() - t0
-        remaining = duration - elapsed - 0.08
-        if remaining > 0:
-            time.sleep(remaining)
+        now = time.monotonic()
+        # Cumulative deadline rather than a per-block `- 0.08`: the old form had
+        # no way to give back the lead it took, so it drifted 80ms further ahead
+        # of the MCU on every block. Here the lead is bounded by MAX_LEAD_S no
+        # matter how long the utterance runs.
+        if deadline is None:
+            deadline = t0
+        deadline += duration
+        if deadline < now:
+            # PlayStream (plus rpc_proxy) is the bottleneck — stop accruing a
+            # debt we cannot pay off and re-anchor on the current time.
+            deadline = now
+        wake = deadline - self.MAX_LEAD_S
+        if wake > now and not self._interrupt_flag.is_set():
+            time.sleep(wake - now)
+        return deadline
 
 
 class SpeakerPlugin:
@@ -396,6 +630,35 @@ class SpeakerPlugin:
     def start(self) -> None:
         pass
 
+    def _play_startup_sound(self) -> None:
+        """Play startup PCM by directly calling PlayStream in small blocks with pacing."""
+        import pathlib
+        pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
+        try:
+            pcm = pcm_path.read_bytes()
+            block_size = 9600
+            deadline = None
+            for offset in range(0, len(pcm), block_size):
+                block = pcm[offset:offset + block_size]
+                t0 = time.monotonic()
+                code, _ = self._node._client.PlayStream(APP_NAME, "0", block)
+                if code != 0:
+                    self._node.get_logger().warn(f"[speaker] startup sound stopped at offset {offset}: code={code}")
+                    return
+                # Same bounded cumulative deadline as _SpeakerNode._play_merged.
+                # This loop did not even subtract the PlayStream call's own cost,
+                # so it ran further ahead of the MCU than the streaming path.
+                now = time.monotonic()
+                deadline = (t0 if deadline is None else deadline) + len(block) / 32000
+                if deadline < now:
+                    deadline = now
+                wake = deadline - _SpeakerNode.MAX_LEAD_S
+                if wake > now:
+                    time.sleep(wake - now)
+            self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
+        except Exception as e:
+            self._node.get_logger().warn(f"[speaker] startup sound error: {e}")
+
     def stop(self) -> None:
         self._node.stop_play()
 
@@ -404,46 +667,57 @@ class SpeakerPlugin:
             topic = args.get("input_topic", "")
             if not topic:
                 return {"error": "Missing input_topic"}
+            self._node.stop_play()
+            threading.Thread(target=self._play_startup_sound, daemon=True).start()
             topic = self._node.start_play(topic)
-            return {"state": "playing", "topic": topic}
+            return {"state": "ready", "topic": topic}
         elif action == "stop":
             self._node.stop_play()
             return {"state": "idle"}
         elif action == "info":
-            return {"state": self._node.state, "topic": self._node._topic}
+            return {
+                "state": self._node.state,
+                "topic": self._node._topic,
+                "buffer_chunks": self._node._buf.qsize(),
+            }
         return None
 
 
-# ── LedPlugin (actuator) ─────────────────────────────────────────────────────
+# ── SmartMotionPlugin (actuator) ─────────────────────────────────────────
 
-class LedPlugin:
-    PREFIX = "led"
+class SmartMotionPlugin:
+    """统一打断/暂停控制卡片。协调 speaker + loco 的中止和暂停。"""
+    PREFIX = "smart_motion"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
-        self._client = audio_client
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 speaker_plugin=None, loco_plugin=None):
+        self._speaker = speaker_plugin
+        self._loco = loco_plugin
 
     def get_tool(self) -> dict:
         return {
-            "name": "led",
+            "name": "smart_motion",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 RGB LED strip control — set color or turn off",
+            "description": "SmartMotion — 统一运动/输出控制，提供打断、暂停、恢复能力",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["set", "off"],
+                        "enum": ["interrupt_all", "interrupt_speak", "interrupt_motion",
+                                 "pause_speak", "resume_speak", "status"],
                         "description": "Action to perform",
                     },
-                    "r": {"type": "integer", "description": "Red 0-255"},
-                    "g": {"type": "integer", "description": "Green 0-255"},
-                    "b": {"type": "integer", "description": "Blue 0-255"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "set": {"params": ["r", "g", "b"], "description": "Set LED strip to specified RGB color"},
-                    "off": {"params": [],              "description": "Turn off LED strip"},
+                    "interrupt_all":    {"params": [], "description": "中止所有输出（语音+动作同时停止）"},
+                    "interrupt_speak":  {"params": [], "description": "中止语音播放，清空待播队列"},
+                    "interrupt_motion": {"params": [], "description": "停止机器人当前运动"},
+                    "pause_speak":      {"params": [], "description": "暂停语音播放（保留未播内容，可恢复）"},
+                    "resume_speak":     {"params": [], "description": "恢复之前暂停的语音播放"},
+                    "status":           {"params": [], "description": "查询当前输出状态（语音/运动）"},
                 },
             },
         }
@@ -459,16 +733,161 @@ class LedPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
-        if action == "set":
-            r   = int(args.get("r", 0))
-            g   = int(args.get("g", 0))
-            b   = int(args.get("b", 0))
+        if action == "interrupt_all":
+            r1 = self._do_interrupt_speak()
+            r2 = self._do_interrupt_motion()
+            return {"speak": r1, "motion": r2}
+        elif action == "interrupt_speak":
+            return self._do_interrupt_speak()
+        elif action == "interrupt_motion":
+            return self._do_interrupt_motion()
+        elif action == "pause_speak":
+            if self._speaker:
+                return self._speaker._node.pause()
+            return {"error": "no speaker plugin"}
+        elif action == "resume_speak":
+            if self._speaker:
+                return self._speaker._node.resume()
+            return {"error": "no speaker plugin"}
+        elif action == "status":
+            return {
+                "speak": self._speaker.dispatch("info", {}) if self._speaker else None,
+                "motion": self._loco.dispatch("info", {}) if self._loco else None,
+            }
+        return None
+
+    def _do_interrupt_speak(self) -> dict | None:
+        if self._speaker:
+            return self._speaker._node.interrupt()
+        return {"error": "no speaker plugin"}
+
+    def _do_interrupt_motion(self) -> dict | None:
+        if self._loco:
+            return self._loco.dispatch("stop_move", {})
+        return {"error": "no loco plugin"}
+
+
+# ── LedPlugin (actuator) ─────────────────────────────────────────────────────
+
+class LedPlugin:
+    PREFIX = "led"
+
+    # State priority: higher number = higher priority
+    _PRIORITY = {'idle': 0, 'hearing': 1, 'thinking': 3, 'speaking': 4, 'error': 5}
+    # Auto-timeout per state (seconds). None = must be explicitly overridden.
+    _TIMEOUT = {'idle': None, 'hearing': 1.2, 'thinking': 60, 'speaking': 120, 'error': 5}
+    # State → solid color (R1 has no animation support, only solid colors)
+    _COLORS = {
+        'idle':     (0, 0, 0),
+        'hearing':  (0, 80, 255),
+        'thinking': (80, 40, 255),
+        'speaking': (0, 200, 220),
+        'error':    (255, 0, 0),
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
+        self._client = audio_client
+        self._state = 'idle'
+        self._state_lock = threading.Lock()
+        self._timeout_timer = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "led",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "R1 LED strip — state-driven (hook-triggered) or manual RGB control",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["state", "set", "off"],
+                        "description": "Action to perform",
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["idle", "hearing", "thinking", "speaking", "error"],
+                        "description": "Target LED state (for action=state)",
+                    },
+                    "r": {"type": "integer", "description": "Red 0-255"},
+                    "g": {"type": "integer", "description": "Green 0-255"},
+                    "b": {"type": "integer", "description": "Blue 0-255"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "state": {"params": ["state"], "description": "Transition LED to semantic state (priority-managed)"},
+                    "set":   {"params": ["r", "g", "b"], "description": "Manual RGB override (bypasses state machine)"},
+                    "off":   {"params": [], "description": "Turn off LED (resets state to idle)"},
+                },
+                "x-hooks": {
+                    "on_hearing":    {"action": "state", "params": {"state": "hearing"}},
+                    "on_thinking":   {"action": "state", "params": {"state": "thinking"}},
+                    "on_speaking":   {"action": "state", "params": {"state": "speaking"}},
+                    "on_idle":       {"action": "state", "params": {"state": "idle"}},
+                    "on_error":      {"action": "state", "params": {"state": "error"}},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self._cancel_timeout()
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": self._state}
+        if action == "stop":
+            self._transition('idle')
+            return {"state": "idle"}
+        if action == "state":
+            new_state = args.get("state", "idle")
+            if new_state not in self._PRIORITY:
+                return {"error": f"unknown state: {new_state}"}
+            self._transition(new_state)
+            return {"state": self._state}
+        elif action == "set":
+            self._transition('idle')
+            r = int(args.get("r", 0))
+            g = int(args.get("g", 0))
+            b = int(args.get("b", 0))
             ret = self._client.LedControl(r, g, b)
             return {"ret": ret, "r": r, "g": g, "b": b}
         elif action == "off":
-            ret = self._client.LedControl(0, 0, 0)
-            return {"ret": ret}
+            self._transition('idle')
+            return {"state": "idle"}
         return None
+
+    def _transition(self, new_state: str):
+        """Priority-based state transition."""
+        with self._state_lock:
+            if new_state not in ('idle', 'error'):
+                if self._PRIORITY.get(new_state, 0) <= self._PRIORITY.get(self._state, 0):
+                    return
+            self._state = new_state
+
+        self._cancel_timeout()
+        color = self._COLORS.get(new_state, (0, 0, 0))
+        self._client.LedControl(*color)
+
+        timeout = self._TIMEOUT.get(new_state)
+        if timeout:
+            expected_state = new_state
+            def _timeout_cb(expected=expected_state):
+                with self._state_lock:
+                    if self._state != expected:
+                        return
+                self._transition('idle')
+            self._timeout_timer = threading.Timer(timeout, _timeout_cb)
+            self._timeout_timer.daemon = True
+            self._timeout_timer.start()
+
+    def _cancel_timeout(self):
+        if self._timeout_timer:
+            self._timeout_timer.cancel()
+            self._timeout_timer = None
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────
@@ -563,6 +982,40 @@ class LocoStatePlugin:
 
 # ── LocoPlugin (actuator) ────────────────────────────────────────────────────
 
+import os as _os
+
+_LOCO_AGENT_CORE_URL = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+
+
+def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loco"):
+    """POST ACP completion callback to Agent Core."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id, "status": status,
+        "result": result, "tool": tool, "ts": time.time(),
+    }).encode()
+    try:
+        req = _urllib.Request(
+            f"{_LOCO_AGENT_CORE_URL}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = _urllib.urlopen(req, timeout=5, context=ctx)
+        print(f"[Loco] ACP notify {action_id} -> {resp.status} "
+              f"({_LOCO_AGENT_CORE_URL})", flush=True)
+    except Exception as e:
+        # agent-core's barrier is now waiting on this callback. If it never lands the
+        # turn stalls until x-completion times out, so make the failure loud.
+        print(f"[Loco] ACP notify FAILED for {action_id} -> {_LOCO_AGENT_CORE_URL}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
 class LocoPlugin:
     """R1 locomotion control via LocoClient RPC (sport service) + ArmClient (arm service).
 
@@ -599,6 +1052,13 @@ class LocoPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, loco_client):
         self._client = loco_client
         self._namespace = namespace
+        # Only one FSM sequence may be in flight. Async dispatch means the robot
+        # now spends 6-13s mid-transition while the agent is free to send more
+        # posture commands, and a second sequence starting on a half-standing robot
+        # is how a "safe" call becomes a fall.
+        self._fsm_busy = threading.Lock()
+        self._fsm_active: str | None = None
+        self._stop_move_ret: int | None = None
 
     def get_tools(self) -> list:
         return [self._loco_tool(), self._switch_mode_tool(), self._arm_tool()]
@@ -635,27 +1095,73 @@ class LocoPlugin:
     _STANDING_STATES = {811}      # loco_mode — fully operational standing
     # FSM=4 (stance) is intermediate: allow both standup (continue) and lie-down (retreat)
 
+    # 701/702 are the *motion in progress* states: the robot is physically moving
+    # between postures and is neither down nor up. Measured on hardware: a healthy
+    # standup2lie sits in 702 for ~6s, a healthy lie2standup sits in 701 for ~3s.
+    #
+    # Every guard used to ignore them, and `fsm_to_start` below defaulted unknown
+    # readings to "start from step 0" -- i.e. ZeroTorque() on a robot that is
+    # halfway through standing up. While switch_mode was synchronous the window
+    # could not be observed (dispatch blocked, and the ACP barrier held back the
+    # next actuator); async dispatch opens it for the full 6-9s.
+    _TRANSITIONAL_STATES = {701, 702}
+
+    # Which transitional state a posture change must pass through. Reaching the
+    # target without ever seeing it means the robot got there by falling, not by
+    # lowering/raising itself -- both transitions last several seconds, so 1s
+    # polling cannot miss them.
+    _EXPECTED_TRANSIT = {"standup2lie": 702, "lie2standup": 701}
+
+    _FSM_NAMES = {
+        0: "zero_torque", 1: "damp", 4: "stance",
+        701: "lie2standup (in progress)", 702: "standup2lie (in progress)",
+        811: "loco_mode",
+    }
+
     def _switch_mode_tool(self) -> dict:
         return {
             "name": "switch_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 locomotion mode switch (safe). "
-                           "damp=阻尼(ground only), zero_torque=零力矩(ground only), "
-                           "lie2standup=安全起立序列(ground→运控), standup2lie=安全躺下序列(standing→阻尼), "
-                           "emergency_stop=紧急阻尼(any state, accepts fall risk)",
+            "description": "R1 posture switch. "
+                           "lie2standup=安全起立序列(躺→站), standup2lie=安全躺下序列(站→躺), "
+                           "emergency_stop=紧急阻尼(任何状态，接受摔倒风险), "
+                           "get_current_mode=查询当前姿态。"
+                           "起立/躺下是异步的：立即返回 action_id，动作完成后回调通知。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["damp", "zero_torque",
-                                 "lie2standup", "standup2lie",
+                        # damp / zero_torque used to be exposed here. They are the only
+                        # way for the model to go limp directly, they only ever made
+                        # sense on the ground, and having four ways to "lie down" in one
+                        # enum invited the model to pick a raw motor mode when it wanted
+                        # a posture change. The model only needs lie/stand; the internal
+                        # ZeroTorque/Damp steps still run inside lie2standup, and
+                        # emergency_stop remains the one explicit way to go limp.
+                        "enum": ["lie2standup", "standup2lie",
                                  "emergency_stop", "get_current_mode"],
-                        "description": "Target mode, or get_current_mode to query current state.",
+                        "description": "Target posture, or get_current_mode to query current state.",
                     },
                 },
                 "required": ["mode"],
+                # lie2standup / standup2lie run a multi-step FSM sequence that takes
+                # ~12s. They return immediately with an action_id and fire the ACP
+                # callback when the sequence ends, so the agent can keep reasoning
+                # (and keep talking) while the robot moves.
+                #
+                # No "actions" filter here: agent-core matches it against
+                # args["action"] (mcp_client.py:504), and this tool's parameter is
+                # named "mode" -- a filter would never match. Without one every
+                # dispatch is eligible, and the real gate becomes whether the
+                # response carries an action_id (mcp_client.py:511). emergency_stop
+                # and get_current_mode are single RPCs that return in milliseconds and
+                # deliberately return no action_id, so they stay synchronous.
+                #
+                # timeout mirrors _run_fsm_sequence's worst case: 4 steps x 15s
+                # step_timeout plus interval and settle, with margin.
+                "x-completion": {"timeout": 90},
             },
         }
 
@@ -717,14 +1223,43 @@ class LocoPlugin:
         elif action == "switch_mode":
             mode = args.get("mode", "")
             code, current_fsm = self._client.GetFsmId()
+            print(f"[fsm] switch_mode(mode={mode!r}): GetFsmId -> fsm={current_fsm} "
+                  f"(code={code})", flush=True)
+            if code != 0:
+                # Every guard below keys off current_fsm. Acting on a failed read is
+                # how a "safe" call turns into a collapse, so refuse instead.
+                print(f"[fsm] switch_mode: REFUSED, cannot read FSM (code={code})", flush=True)
+                return {"error": f"Cannot read current FSM state (code={code}). "
+                                 f"Refusing to switch posture."}
 
             if mode == "emergency_stop":
+                print("[fsm] emergency_stop: Damp() regardless of state", flush=True)
                 ret = self._client.Damp()
+                print(f"[fsm] emergency_stop: Damp() -> ret={ret}", flush=True)
                 return {"ret": ret, "mode": "emergency_stop",
                         "warning": "Emergency damp executed regardless of state"}
 
-            elif mode == "lie2standup":
+            # Everything below moves the robot between postures. None of it is safe
+            # to start while a previous transition is still running, so both the
+            # measured FSM and our own in-flight flag have to be clear first.
+            if mode in ("lie2standup", "standup2lie"):
+                if current_fsm in self._TRANSITIONAL_STATES:
+                    print(f"[fsm] {mode}: REFUSED, robot is mid-transition "
+                          f"(fsm={current_fsm})", flush=True)
+                    return {"error": f"Robot is still changing posture "
+                                     f"(fsm={current_fsm}: "
+                                     f"{self._FSM_NAMES.get(current_fsm)}). "
+                                     f"Wait for the current action to report完成 "
+                                     f"before switching again."}
+                if self._fsm_busy.locked():
+                    print(f"[fsm] {mode}: REFUSED, a sequence is already running "
+                          f"({self._fsm_active})", flush=True)
+                    return {"error": f"A posture change ({self._fsm_active}) is already "
+                                     f"running. Wait for its completion callback."}
+
+            if mode == "lie2standup":
                 if current_fsm == 811:
+                    print("[fsm] lie2standup: already standing, no-op", flush=True)
                     return {"info": "Robot is already in loco mode (standing)", "fsm_id": 811}
                 # Full sequence: zero_torque(0) → damp(1) → stance(4) → start(811)
                 all_steps = [
@@ -733,32 +1268,61 @@ class LocoPlugin:
                     ("Stance",      4, "stance"),
                     ("Lie2StandUp", 811, "lie2standup"),
                 ]
-                # Skip completed steps based on current FSM
+                # Skip completed steps based on current FSM.
+                #
+                # This used to be `fsm_to_start.get(current_fsm, 0)` -- any FSM the
+                # table did not recognise fell through to "start at step 0", i.e.
+                # ZeroTorque() on a robot whose posture we did not understand. 701
+                # and 702 (transition in progress) are exactly such values, and they
+                # are caught above; anything else is a state we have no plan for, so
+                # refuse rather than guess and drop the robot.
                 fsm_to_start = {0: 1, 1: 2, 4: 3}
-                start_idx = fsm_to_start.get(current_fsm, 0)
-                return self._run_fsm_sequence(all_steps[start_idx:])
+                if current_fsm not in fsm_to_start:
+                    print(f"[fsm] lie2standup: REFUSED, unrecognised fsm={current_fsm}",
+                          flush=True)
+                    return {"error": f"Unrecognised FSM state {current_fsm} "
+                                     f"({self._FSM_NAMES.get(current_fsm, 'unknown')}). "
+                                     f"Refusing to run the stand-up sequence from here."}
+                start_idx = fsm_to_start[current_fsm]
+                steps = all_steps[start_idx:]
+                print(f"[fsm] lie2standup: from fsm={current_fsm}, skipping {start_idx} step(s), "
+                      f"running {[s[2] for s in steps]}", flush=True)
+                return self._async_fsm(mode, steps)
 
             elif mode == "standup2lie":
                 if current_fsm in self._GROUND_STATES:
+                    print(f"[fsm] standup2lie: already down (fsm={current_fsm}), no-op", flush=True)
                     return {"info": "Robot is already lying down", "fsm_id": current_fsm}
                 if current_fsm == 4:
                     # From stance: enter loco first, then lie down
                     steps = [("Start", 811, "start"), ("StandUp2Lie", 1, "standup2lie")]
-                else:
-                    # From 811 (loco mode): stop movement first, then lie down safely
-                    self._client.StopMove()
-                    import time as _time; _time.sleep(1.0)
-                    steps = [("StandUp2Lie", 1, "standup2lie")]
-                return self._run_fsm_sequence(steps)
+                    print(f"[fsm] standup2lie: from stance (fsm=4), running "
+                          f"{[s[2] for s in steps]}", flush=True)
+                    return self._async_fsm(mode, steps)
+                if current_fsm not in self._STANDING_STATES:
+                    print(f"[fsm] standup2lie: REFUSED, unrecognised fsm={current_fsm}",
+                          flush=True)
+                    return {"error": f"Unrecognised FSM state {current_fsm} "
+                                     f"({self._FSM_NAMES.get(current_fsm, 'unknown')}). "
+                                     f"Refusing to run the lie-down sequence from here."}
+                # From 811 (loco mode): stop movement first, then lie down safely.
+                # StopMove + the settle sleep run inside the worker thread too --
+                # leaving them here would keep dispatch blocked for a second and
+                # defeat the point of going async.
+                steps = [("StandUp2Lie", 1, "standup2lie")]
+                print(f"[fsm] standup2lie: from fsm={current_fsm}, StopMove first, then "
+                      f"{[s[2] for s in steps]}", flush=True)
+                return self._async_fsm(mode, steps, stop_first=True)
 
             elif mode in ("zero_torque", "damp"):
-                if current_fsm in self._STANDING_STATES or current_fsm == 4:
-                    return {"error": f"Cannot enter {mode} from upright state "
-                                     f"(FSM={current_fsm}). Robot will collapse. "
-                                     f"Use standup2lie first."}
-                fn = self._client.ZeroTorque if mode == "zero_torque" else self._client.Damp
-                ret = fn()
-                return {"ret": ret, "mode": mode}
+                # Removed from the tool enum: these are raw motor modes, not postures,
+                # and they were the only way for the model to go limp directly. Kept as
+                # an explicit refusal so a stale cached schema or a hand-made call gets
+                # a clear answer instead of silently dropping the robot.
+                print(f"[fsm] switch_mode: REFUSED removed mode {mode!r}", flush=True)
+                return {"error": f"'{mode}' is no longer available. "
+                                 f"Use standup2lie to lie down, or emergency_stop "
+                                 f"if the robot must go limp immediately."}
 
             elif mode == "get_current_mode":
                 code, fsm_id = self._client.GetFsmId()
@@ -773,7 +1337,7 @@ class LocoPlugin:
 
             else:
                 return {"error": f"Unknown mode: {mode}. "
-                                 f"Available: damp, zero_torque, lie2standup, standup2lie, emergency_stop, get_current_mode"}
+                                 f"Available: lie2standup, standup2lie, emergency_stop, get_current_mode"}
         # ── Arm actions (tool_name="arm", action = gesture name) ────────────────
         elif action == "release":
             # release_arm (id=99) puts hands down
@@ -801,6 +1365,116 @@ class LocoPlugin:
         if result is None:
             return {"error": "RPC timeout during sequence execution"}
         return result
+
+    def _async_fsm(self, mode: str, steps: list, stop_first: bool = False) -> dict:
+        """Launch an FSM sequence in the background, return an action_id immediately.
+
+        The sequence takes ~10-13s. Running it synchronously froze the whole agent
+        turn for that long -- no reasoning, no speech, nothing. Now dispatch returns
+        at once and the ACP callback reports the outcome.
+
+        Claiming _fsm_busy here rather than in the worker closes the window between
+        "dispatch decided to go" and "the thread got scheduled": two calls arriving
+        together would both pass the check in dispatch and both start moving the
+        robot.
+        """
+        from uuid import uuid4
+        if not self._fsm_busy.acquire(blocking=False):
+            print(f"[fsm] {mode}: REFUSED at launch, {self._fsm_active} still running",
+                  flush=True)
+            return {"error": f"A posture change ({self._fsm_active}) is already running. "
+                             f"Wait for its completion callback."}
+        action_id = f"r1_fsm_{uuid4().hex[:8]}"
+        self._fsm_active = action_id
+        print(f"[fsm] {action_id}: dispatching async, mode={mode} "
+              f"steps={[s[2] for s in steps]} stop_first={stop_first}", flush=True)
+        try:
+            threading.Thread(
+                target=self._acp_fsm_sequence,
+                args=(action_id, mode, steps, stop_first),
+                daemon=True,
+            ).start()
+        except Exception:
+            self._fsm_active = None
+            self._fsm_busy.release()
+            raise
+        return {"status": "executing", "mode": mode, "action_id": action_id}
+
+    def _acp_fsm_sequence(self, action_id: str, mode: str, steps: list,
+                          stop_first: bool = False):
+        """Worker: run the sequence, then fire the ACP callback.
+
+        The callback must go out on every path, and _fsm_busy must be released on
+        every path. Swallowing an exception here would leave agent-core's barrier
+        waiting out the full 90s timeout for a sequence that already died, and would
+        wedge the plugin against every future posture change.
+        """
+        t0 = time.monotonic()
+        print(f"[fsm] {action_id}: worker started (thread={threading.current_thread().name})",
+              flush=True)
+        try:
+            if stop_first:
+                ret = self._client.StopMove()
+                if ret != 0:
+                    # StopMove is what clears residual motion before the lie-down.
+                    # It is not fatal on its own (it returns non-zero on healthy runs
+                    # too), but "lie down while still moving" is the leading theory
+                    # for a controlled descent degrading into a collapse, so carry it
+                    # into the result rather than dropping it.
+                    print(f"[fsm] {action_id}: WARNING StopMove() -> ret={ret} (non-zero)",
+                          flush=True)
+                else:
+                    print(f"[fsm] {action_id}: StopMove() -> ret={ret}", flush=True)
+                self._stop_move_ret = ret
+                time.sleep(1.0)
+            print(f"[fsm] {action_id}: entering RunFsmSequence at t={time.monotonic()-t0:.2f}s",
+                  flush=True)
+            result = self._run_fsm_sequence(steps)
+        except Exception as e:
+            print(f"[fsm] {action_id}: worker raised {type(e).__name__}: {e}", flush=True)
+            result = {"error": f"{type(e).__name__}: {e}"}
+        finally:
+            self._fsm_active = None
+            self._fsm_busy.release()
+
+        status = "error" if result.get("error") else "completed"
+        elapsed = time.monotonic() - t0
+
+        # Did the robot actually move through the posture, or just arrive at the
+        # target? A healthy standup2lie sits in 702 for ~6s and lie2standup in 701
+        # for ~3s, so 1s polling cannot miss them. Reaching damp without ever seeing
+        # 702 means the robot got down by falling -- which is what happened on
+        # 2026-09-02 and was reported as a clean "completed".
+        expected = self._EXPECTED_TRANSIT.get(mode)
+        seen = result.get("fsm_seen") or {}
+        if status == "completed" and expected is not None:
+            observed = seen.get(mode, [])
+            if expected not in observed:
+                status = "error"
+                result = {**result,
+                          "error": f"{mode} reached its target without ever passing "
+                                   f"through {expected} "
+                                   f"({self._FSM_NAMES.get(expected)}). The robot did "
+                                   f"not perform a controlled transition.",
+                          "anomaly": "missing_transitional_state",
+                          "expected_transitional": expected,
+                          "fsm_observed": observed}
+                print(f"[fsm] {action_id}: ANOMALY {mode} never entered {expected}; "
+                      f"observed={observed} -- treating as error, not completion",
+                      flush=True)
+
+        if stop_first:
+            result = {**result, "stop_move_ret": self._stop_move_ret}
+        print(f"[fsm] {action_id}: {status} after {elapsed:.2f}s -> {result}", flush=True)
+        if status == "completed" and not result.get("fsm_measured", True):
+            # The final FSM could not be read, so "completed" is the target we aimed
+            # at, not the state the robot is in. Say so rather than implying evidence.
+            print(f"[fsm] {action_id}: WARNING final FSM unreadable; "
+                  f"reporting target {result.get('fsm_target')} unverified", flush=True)
+        _loco_acp_notify(action_id, status,
+                         {"mode": mode, "elapsed_s": round(elapsed, 2), **result},
+                         tool="switch_mode")
+        print(f"[fsm] {action_id}: ACP callback sent (status={status})", flush=True)
 
     # ── Arm helpers ───────────────────────────────────────────────────────────
 

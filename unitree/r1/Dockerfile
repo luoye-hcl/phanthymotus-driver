@@ -59,6 +59,7 @@ ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/ /work/resource/
+COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY rpc_proxy.py /work/rpc_proxy.py
@@ -68,10 +69,13 @@ COPY deploy/     /deploy/
 
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
+# ANSI colour codes are control bytes; in a non-tty container log they are
+# exactly the "garbage characters" that make `docker logs` unreadable.
+ENV RCUTILS_COLORIZED_OUTPUT=0
 
 # Suppress CycloneDDS tracing to stdout (prevent oversized log messages)
 ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 
 EXPOSE 15702
 
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth10}"]
+CMD ["/bin/bash", "-c", "if command -v nvpmodel >/dev/null 2>&1; then nvpmodel -m 0 2>/dev/null; jetson_clocks 2>/dev/null; echo '[init] Jetson MAXN + clocks locked'; fi && source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth10}"]

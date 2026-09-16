@@ -16,6 +16,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libusb-1.0-0 \
         libportaudio2 \
         libasound2-dev \
+        ffmpeg \
         v4l-utils && \
     rm -rf /var/lib/apt/lists/*
 
@@ -45,22 +46,30 @@ ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/       /work/resource/
+COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
+COPY sport_mode_state.py /work/sport_mode_state.py
 COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
+COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
+COPY test_slam_rpc.py /work/test_slam_rpc.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
+# ANSI colour codes are control bytes; in a non-tty container log they are
+# exactly the "garbage characters" that make `docker logs` unreadable.
+ENV RCUTILS_COLORIZED_OUTPUT=0
 
 # Suppress CycloneDDS tracing to stdout (prevent oversized log messages)
 ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 
 EXPOSE 15701
 
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]
+CMD ["/bin/bash", "-c", "if command -v nvpmodel >/dev/null 2>&1; then nvpmodel -m 0 2>/dev/null; jetson_clocks 2>/dev/null; echo '[init] Jetson MAXN + clocks locked'; fi && source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]
